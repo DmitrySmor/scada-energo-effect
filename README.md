@@ -1,0 +1,1 @@
+# scada-energo-effect
