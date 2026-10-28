@@ -1,0 +1,26 @@
+# Секреты и локальные данные — никогда не коммитить (ТЗ, п.15)
+.env
+*.pem
+*.key
+docker/mosquitto/passwd
+docker/mosquitto/certs/*
+!docker/mosquitto/certs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# IDE / ОС
+.idea/
+.vscode/
+.DS_Store
+
+# Локальные артефакты
+backups/
+*.log

@@ -1,0 +1,17 @@
+# Конфигурация фоновых задач планировщика (контейнер scheduler, ТЗ п.14).
+# fabric-агент читает этот файл; задачи реализуются в app.services.monitoring.
+
+[[task]]
+name = "check_devices_offline"
+schedule = "* * * * *"          # каждую минуту: last_seen_at vs DEVICE_OFFLINE_AFTER_MINUTES
+command = "python -m app.services.monitoring check-offline"
+
+[[task]]
+name = "notifications_flush"
+schedule = "*/5 * * * *"         # агрегация/подавление повторяющихся уведомлений
+command = "python -m app.services.monitoring flush-notifications"
+
+[[task]]
+name = "logs_rotate"
+schedule = "0 3 * * *"           # ротация логов (сроки хранения — согласование, ТЗ п.16/21)
+command = "python -m app.services.monitoring rotate-data"

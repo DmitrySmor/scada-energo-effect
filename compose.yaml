@@ -1,0 +1,220 @@
+# =============================================================================
+# SCADA Backend — корневой Docker Compose файл проекта.
+#
+# Репозиторий разворачивается на сервере как каталог /opt/docker/iot-project/,
+# поэтому относительные пути ниже считаются от этого каталога.
+#
+# Развёртывание на сервере (Debian 13):
+#   git clone <репозиторий> /opt/docker/iot-project
+#   cd /opt/docker/iot-project
+#   cp .env.example .env                 # заполнить секреты и параметры
+#   docker compose up -d                 # запуск всех сервисов
+#
+# Требования ТЗ, реализованные здесь:
+#   * все сервисы подключаются к существующей внешней сети "proxy";
+#   * постоянные данные — только через bind mounts в /data/<имя_контейнера>/;
+#   * PostgreSQL + TimescaleDB с первого развёртывания;
+#   * MQTT-брокер (Mosquitto) с TLS, аутентификацией по паролям и ACL;
+#   * незашифрованный MQTT-порт (1883) наружу не публикуется.
+# =============================================================================
+
+name: iot-project
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # База данных: PostgreSQL с расширением TimescaleDB (образ уже включает
+  # расширение). Таблица readings создаётся как hypertable миграциями Alembic.
+  # Данные хост-машины: /data/postgres
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: timescale/timescaledb:latest-pg16
+    container_name: postgres                     # задаём имя явно: от него зависит путь /data/<container_name>
+    restart: unless-stopped
+    shm_size: 256mb                              # общая память для внутренних нужд PostgreSQL
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}                # имя базы (из .env)
+      POSTGRES_USER: ${POSTGRES_USER}            # пользователь (из .env)
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}    # пароль (из .env, в Git не попадает)
+      TZ: UTC                                    # вся работа с временем — в UTC (ТЗ, п.7)
+    volumes:
+      # Bind mount постоянных данных на хост (без именованных volumes — ТЗ, п.3)
+      - /data/postgres:/var/lib/postgresql/data
+      # Скрипт первоначальной настройки: создание extension timescaledb и т.п.
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    networks:
+      - proxy          # существующая внешняя сеть reverse-proxy
+      - scada_internal # внутренняя сеть для изоляции backend <-> postgres <-> mqtt
+    ports: []          # порт 5432 наружу НЕ публикуем — доступ только из scada_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # Примечание по правам (ТЗ, п.3): процессы внутри контейнера работают под
+    # UID/GID 999. Перед первым запуском на хосте выполните:
+    #   sudo install -d -o 999 -g 999 /data/postgres
+
+  # ---------------------------------------------------------------------------
+  # MQTT-брокер Eclipse Mosquitto.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    restart: unless-stopped
+    networks:
+      - proxy
+      - scada_internal
+    # Публикуем только защищённый TLS-порт. Незашифрованный 1883 наружу
+    # недоступен согласно ТЗ, п.4. Backend подключается к broker'у по
+    # внутренней сети scada_internal без публикации порта вообще.
+    ports:
+      - "8883:8883"
+    volumes:
+      # Конфигурация брокера (TLS, ACL, аутентификация) — из репозитория
+      - ./docker/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      # Правила ACL (публикация устройств только в свои топики — ТЗ, п.4)
+      - ./docker/mosquitto/acl:/mosquitto/config/acl:ro
+      # Список пользователей (генерируется скриптом scripts/add_device.sh)
+      - ./docker/mosquitto/passwd:/mosquitto/config/passwd:ro
+      # Сертификаты TLS (Let's Encrypt / собственный CA) — на хосте
+      - ./docker/mosquitto/certs:/mosquitto/config/certs:ro
+      # Данные брокера (персистентность сообщений QoS 1 и сессий) — bind mount
+      - /data/mosquitto/data:/mosquitto/data
+      - /data/mosquitto/log:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h localhost -p 1883 -t '$$SYS/broker/uptime' -C 1 -W 3 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Примечание по правам: mosquitto работает под UID/GID 100:
+    #   sudo install -d -o 100 -g 100 /data/mosquitto/data /data/mosquitto/log
+
+  # ---------------------------------------------------------------------------
+  # REST API (FastAPI + Uvicorn).
+  # Код приложения: backend/app, Dockerfile: backend/Dockerfile
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ./backend              # контекст сборки — каталог backend/
+      dockerfile: Dockerfile
+    image: scada-backend/api:latest
+    container_name: api
+    restart: unless-stopped
+    env_file: .env                    # все настройки приложения приходят из окружения
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    networks:
+      - proxy          # reverse-proxy ходит сюда по HTTPS (см. docker/proxy/README.md)
+      - scada_internal
+    depends_on:
+      postgres:
+        condition: service_healthy    # ждём готовности БД перед стартом API
+    ports: []          # сам API наружу не публикуется — только через reverse-proxy
+    healthcheck:
+      # Проверка работоспособности процесса (ТЗ, п.12: /api/v1/health/live)
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/live', timeout=3)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # MQTT-воркер: приём сообщений, валидация, дедупликация по message_id,
+  # запись в TimescaleDB и публикация прикладных подтверждений (ТЗ, п.5–8).
+  # Тот же образ, что и у api, но другая точка входа.
+  # ---------------------------------------------------------------------------
+  mqtt-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: scada-backend/api:latest
+    container_name: mqtt-worker
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "-m", "app.mqtt.worker"]
+    networks:
+      - scada_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # Планировщик фоновых задач: мониторинг offline-устройств, уведомления,
+  # ротация данных (ТЗ, п.14). Задачи описаны в docker/tasks/tasks.toml.
+  # ---------------------------------------------------------------------------
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: scada-backend/api:latest
+    container_name: scheduler
+    restart: unless-stopped
+    env_file: .env
+    command: ["fabric", "run", "-i", "docker/tasks/tasks.toml"]
+    networks:
+      - scada_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Одноразовый сервис миграций БД (Alembic). Запускается вручную:
+  #   docker compose --profile tools run --rm migrate
+  # Выполняет upgrade head (создание таблиц и hypertable readings).
+  # ---------------------------------------------------------------------------
+  migrate:
+    profiles: ["tools"]               # не стартует автоматически
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: scada-backend/api:latest
+    container_name: migrate
+    restart: "no"
+    env_file: .env
+    command: ["alembic", "upgrade", "head"]
+    networks:
+      - scada_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Резервное копирование PostgreSQL/TimescaleDB (ТЗ, п.17).
+  # Запускается из cron на хосте или вручную:
+  #   docker compose --profile backup run --rm backup
+  # Копии пишутся в BACKUP_DIR (согласно ТЗ — отдельный диск от /data!).
+  # ---------------------------------------------------------------------------
+  backup:
+    profiles: ["backup"]
+    image: postgres:16
+    container_name: backup
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: ["/bin/sh", "/scripts/backup.sh"]
+    volumes:
+      - ./docker/scripts/backup.sh:/scripts/backup.sh:ro
+      - ${BACKUP_DIR:-/backups/iot-project}:/backups
+    networks:
+      - scada_internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+# =============================================================================
+# Сети
+# =============================================================================
+networks:
+  # Существующая внешняя сеть reverse-proxy. Проект её НЕ создаёт и НЕ удаляет
+  # (требование ТЗ, п.3). Ожидается, что она уже существует на хосте:
+  #   docker network create proxy   (выполняется один раз, вне проекта)
+  proxy:
+    external: true
+
+  # Внутренняя изолированная сеть для взаимодействия сервисов проекта
+  # (разрешена ТЗ, п.3). Создаётся автоматически вместе с проектом.
+  scada_internal:
+    driver: bridge
