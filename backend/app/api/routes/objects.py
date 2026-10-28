@@ -32,7 +32,8 @@ async def get_object(object_id: int) -> None:
 
 @router.patch("/{object_id}")
 async def update_object(object_id: int) -> None:
-    raise NotImplementedError("TODO: изменить объект (admin; user — по согласованию)")
+    # Согласовано (2026-10-29): PATCH объекта доступен только роли admin.
+    raise NotImplementedError("TODO: изменить объект (только admin)")
 
 
 @router.get("/{object_id}/devices")
